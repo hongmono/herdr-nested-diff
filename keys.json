@@ -1,0 +1,5 @@
+{
+  "global": {
+    "cmd-shift-g": "layout.toggle:nested-diff"
+  }
+}
