@@ -27,7 +27,8 @@ Nested Diff panel, top to bottom:
 - The panel follows the focused terminal's working directory. Clicking inside the panel keeps showing the last terminal you came from in that tab.
 - Base: the git repo containing that directory, or the plain folder if it isn't a repo (a folder of repos). It refuses to scan your home folder.
 - Nested repos are found with `find` up to 6 levels deep (max 60 repos), skipping `node_modules`, `.venv`, `venv`, `target`, `dist`, `build`, `.next`, `.nuxt`, `.cache`, `vendor`, `Pods`, `.gradle`, `.terraform`, `__pycache__`, `.direnv`. The repo list is re-walked every 60s, or immediately when a `.git` appears or disappears.
-- Changes refresh every 10s and on any file change under the base (folder watch), ignoring churn inside the pruned folders.
+- Changes refresh on any file change under the base (folder watch), ignoring churn inside the pruned folders, plus a safety refresh every 60s. Without a folder watch (a space on another machine, or the watch failed) it polls every 10s instead. A change that lands while a refresh is running triggers one more pass right after it.
+- When more than 60 nested repos are found, a dim line under the list says `Showing the first 60 nested repos`.
 - The first changed file opens automatically. Click a file to open its diff, click it again to close it. Click a group header to fold it.
 - Untracked and newly added files show their whole content as additions. Binary files say so. Limits: 1000 files per repo, 1500 diff lines, 4000 characters per line.
 - Graph: double-click a label to check out; right-click labels/commits for menus (checkout, merge, rebase, reset, revert, stash, push branch, fetch). Actions open a confirmation dialog when they need input, run git, and show a success or error toast.
@@ -52,6 +53,7 @@ Nested Diff panel, top to bottom:
 - A child repo appears in its parent's status as `?? sub/` or a submodule entry; filter those out so each repo shows once, in its own group.
 - In a repo with no commits yet there is no `HEAD`: diff `--cached` plus the worktree instead of `diff HEAD`.
 - Large folders: pruning and the depth/repo caps keep the scan fast; scanning `home()` is blocked.
+- Run the per-repo git work a few repos at a time (6), not all at once: 60 repos in parallel open more pipes than the process may (`Too many open files`, os error 24) and some repos show `error`.
 - `cmd-shift-g` is a macOS chord; on Windows/Linux pick another key.
 - Needs `git` and `find` on the machine running the space.
 
@@ -61,5 +63,6 @@ Nested Diff panel, top to bottom:
 - In a repo with an edited file, the file appears with `M` and correct `+/−`, and clicking it shows the diff.
 - In a plain folder holding two repos with changes, both appear as separate groups; a repo the parent ignores shows the `ignored` badge.
 - Editing a file updates the list within a few seconds without clicking anything.
+- A folder with 62 nested repos lists 60 of them with no `error` groups and shows `Showing the first 60 nested repos`.
 - The Graph tab draws the commit history; with 2+ repos, the chips switch between them.
 - `cmd-shift-g` hides and shows the panel.

@@ -9,11 +9,23 @@ import { Dialog } from "./dialog.js";
 // Nested git diff: the repo you're in plus every git repo below it,
 // including ones the outer repo ignores or doesn't track.
 
-const MAX_DEPTH = 6, MAX_REPOS = 60, MAX_FILES = 1000, RESCAN_MS = 60000;
+// POLL_MS checks when nothing watches the folder (another machine, or the watch failed);
+// with a live folder watch, a slow SAFETY_MS refresh only catches what the watch can't see.
+const MAX_DEPTH = 6, MAX_REPOS = 60, MAX_FILES = 1000, RESCAN_MS = 60000, POLL_MS = 10000, SAFETY_MS = 60000;
 // Big folders that are never worth walking for nested repos.
 const PRUNE = ["node_modules", ".venv", "venv", "target", "dist", "build", ".next", ".nuxt", ".cache", "vendor", "Pods", ".gradle", ".terraform", "__pycache__", ".direnv"];
 // Reads write nothing under .git, so the folder watch doesn't trigger itself.
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "diff.autoRefreshIndex=false"];
+// git runs per repo at once: unbounded, 60 repos open more pipes than the process may
+// ("Too many open files"), so the per-repo work runs a few at a time, results in order.
+const PARALLEL = 6;
+async function mapLimit(items, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => { while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); } };
+  await Promise.all(Array.from({ length: Math.min(PARALLEL, items.length) }, worker));
+  return out;
+}
 const countLines = (text) => text ? text.split("\n").length - Number(text.endsWith("\n")) : 0;
 
 // The last terminal pane focused in each tab: clicking a mod pane (this one)
@@ -64,7 +76,7 @@ async function findRepos(root, on) {
     .map((p) => p.replace(/\/\.git$/, ""))
     .filter((p) => p !== root && p.startsWith(root + "/"))
     .sort();
-  return found.slice(0, MAX_REPOS);
+  return { repos: found.slice(0, MAX_REPOS), limited: found.length > MAX_REPOS };
 }
 
 export default class NestedDiff extends View {
@@ -75,7 +87,11 @@ export default class NestedDiff extends View {
     this.view = "changes"; this.graph = null; this.graphRepo = null;
     this.groups = []; this.rows = []; this.diffWidth = 0; this.collapsed = new Set();
     this.refresh(cx);
-    cx.timer.every(10000, (cx) => this.refresh(cx));
+    this.refreshedAt = 0;
+    cx.timer.every(POLL_MS, (cx) => {
+      if (this.watched && Date.now() - this.refreshedAt < SAFETY_MS) return;
+      this.refresh(cx);
+    });
     if (props()?.view === "graph") this.setView("graph", cx);
   }
 
@@ -100,10 +116,14 @@ export default class NestedDiff extends View {
   reset() {
     this.base = null; this.repos = null; this.scannedAt = 0; this.groups = []; this.open = null;
     this.setLines([]); this.error = null; this.note = null; this.watched = null; this.closed = false;
+    this.reposLimited = false;
   }
 
   refresh(cx) {
-    if (this.loading) return;
+    // A change that lands mid-refresh runs one more pass after it, so it isn't lost
+    // until the next watch event or timer tick.
+    if (this.loading) { this.again = true; return; }
+    this.again = false;
     const { cwd, on } = location(), context = key();
     if (context !== this.context) { this.context = context; this.reset(); }
     if (!cwd) return;
@@ -121,11 +141,12 @@ export default class NestedDiff extends View {
         }
         const base = this.base;
         if (!this.repos || Date.now() - this.scannedAt > RESCAN_MS) {
-          const nested = await findRepos(base, on);
+          const { repos: nested, limited } = await findRepos(base, on);
           if (key() !== context) return;
+          this.reposLimited = limited;
           const all = [...(this.baseIsRepo ? [base] : []), ...nested];
           // Which repo contains each one, and does it ignore it?
-          const repos = await Promise.all(all.map(async (root) => {
+          const repos = await mapLimit(all, async (root) => {
             const parent = all.filter((r) => r !== root && root.startsWith(r + "/")).sort((a, b) => b.length - a.length)[0];
             let ignored = false;
             if (parent) {
@@ -133,13 +154,13 @@ export default class NestedDiff extends View {
               ignored = (await exec("git", [...READ, "check-ignore", "-q", rel], { cwd: parent, on })).code === 0;
             }
             return { root, rel: root === base ? "" : root.slice(base.length + 1), ignored };
-          }));
+          });
           if (key() !== context) return;
           this.repos = repos; this.scannedAt = Date.now();
         }
         if (!this.repos.length) { this.groups = []; this.error = "No git repositories here"; return; }
 
-        const groups = await Promise.all(this.repos.map((repo) => this.readRepo(repo)));
+        const groups = await mapLimit(this.repos, (repo) => this.readRepo(repo));
         if (key() !== context) return;
         this.groups = groups; this.error = null;
         this.watch(base, cx);
@@ -151,7 +172,11 @@ export default class NestedDiff extends View {
           catch { if (key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
         }
       } catch (e) { if (key() === context) this.error = String(e); }
-      finally { this.loading = false; cx.notify(); }
+      finally {
+        this.loading = false; this.refreshedAt = Date.now();
+        if (this.again) this.refresh(cx);
+        cx.notify();
+      }
     });
   }
 
@@ -360,6 +385,7 @@ export default class NestedDiff extends View {
         .children(listRows)
         .when(!listRows.length, (e) => e.child(div().p(8).text_color(t.dim)
           .child(this.error || (this.loading && !this.groups.length ? "Scanning repositories…" : this.base ? "No uncommitted changes" : "No folder")))))
+      .when(Boolean(this.reposLimited), (e) => e.child(div().px(14).py(4).text_size(11).text_color(t.dim).border_b(1).border_color(t.border).child(`Showing the first ${MAX_REPOS} nested repos`)))
       .when(clean > 0 && dirty.length > 0, (e) => e.child(div().px(14).py(4).text_size(11).text_color(t.dim).border_b(1).border_color(t.border).child(`${clean} clean ${clean === 1 ? "repo" : "repos"} hidden`)))
       .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
         .child(div().id("nested-diff-x").size_full().overflow_x_scrollbar()
